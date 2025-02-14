@@ -599,8 +599,7 @@ dependencies = [
 [[package]]
 name = "lock_debug"
 version = "0.1.4"
-source = "registry+ssh://git@sigit01/~/Development/ContinuousC/Ktra-registry"
-checksum = "4a5eedb31eb3acfe15279771606aa64f09641230428e6a95a4bf89cc8f3bc734"
+source = "git+https://github.com/ContinuousC/LockDebug.git#bb4bf68e9f295d5dec7b313bac889fad1b72f30f"
 dependencies = [
  "lazy_static",
  "log",

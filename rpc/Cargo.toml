@@ -47,7 +47,7 @@ rpc_derive = { version = "0.1.22" }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
-lock_debug = { registry = "si", version = "0.1.4" }
+lock_debug = { version = "0.1.4" }
 simplelog = "0.12"
 rand = "0.8.4"
 env_logger = "0.10.0"
