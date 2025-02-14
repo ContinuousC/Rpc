@@ -30,7 +30,7 @@ enum Error {}
 
 #[test]
 async fn tls_client_server() {
-    tls_client_server_test(
+    let r = tls_client_server_test(
         Path::new("tests/tls_client_server.sock"),
         Path::new("tests/certs/ca.crt"),
         Path::new("tests/certs/server.crt"),
@@ -39,10 +39,11 @@ async fn tls_client_server() {
         Path::new("tests/certs/client.key"),
     )
     .await
+    .expect("failed to run client/server test with correct certs");
+    assert_eq!(r, 123);
 }
 
 #[test]
-#[should_panic]
 async fn tls_evil_client() {
     tls_client_server_test(
         Path::new("tests/tls_evil_client.sock"),
@@ -53,10 +54,10 @@ async fn tls_evil_client() {
         Path::new("tests/certs/evil-client.key"),
     )
     .await
+    .expect_err("succeeded to run client/server test with incorrect certs");
 }
 
 #[test]
-#[should_panic]
 async fn tls_evil_server() {
     tls_client_server_test(
         Path::new("tests/tls_evil_server.sock"),
@@ -67,6 +68,7 @@ async fn tls_evil_server() {
         Path::new("tests/certs/client.key"),
     )
     .await
+    .expect_err("succeeded to run client/server test with incorrect certs");
 }
 
 async fn tls_client_server_test(
@@ -76,8 +78,31 @@ async fn tls_client_server_test(
     server_key: &Path,
     client_crt: &Path,
     client_key: &Path,
-) {
+) -> Result<u64, String> {
     let _ = env_logger::builder().is_test(true).try_init();
+
+    let cert_paths = [ca_crt, server_crt, server_key, client_crt, client_key];
+    let generate_certs = async {
+        for path in &cert_paths {
+            if tokio::fs::metadata(path).await.is_err() {
+                return true;
+            }
+        }
+        false
+    }
+    .await;
+
+    if generate_certs {
+        assert!(
+            tokio::process::Command::new("/bin/bash")
+                .current_dir("tests/certs/")
+                .arg("create-test-certificates.sh")
+                .status()
+                .await
+                .is_ok_and(|s| s.success()),
+            "failed to generate test certificates"
+        )
+    }
 
     if tokio::fs::metadata(sock_path).await.is_ok() {
         tokio::fs::remove_file(sock_path).await.unwrap_or_else(|e| {
@@ -116,17 +141,19 @@ async fn tls_client_server_test(
     client
         .connected(std::time::Duration::from_secs(1))
         .await
-        .unwrap();
+        .map_err(|e| format!("client connection failed: {e}"))?;
 
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(1));
 
     let res: Result<u64, String> = tokio::select! {
         res = client
             .request((),serde_json::to_value(PingPongRequest::Ping { i:123 }).unwrap())
-            => serde_json::from_value(res.expect("request failed")).unwrap(),
+            => res
+                .map_err(|e| format!("request failed: {e}"))
+                .and_then(|r| serde_json::from_value::<Result<u64,String>>(r).unwrap()),
         _ = timeout => panic!("timeout")
     };
-    assert_eq!(res, Ok(123));
+    //assert_eq!(res, Ok(123));
 
     client.shutdown().await.expect("client shutdown failed");
     server.shutdown().await.expect("server shutdown failed");
@@ -134,4 +161,6 @@ async fn tls_client_server_test(
     tokio::fs::remove_file(sock_path).await.unwrap_or_else(|e| {
         panic!("failed to remove '{}': {}", sock_path.display(), e)
     });
+
+    res
 }
