@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+	"rpc",
+	"rpc_derive"
+]
+
+[patch.crates-io]
+rpc = { path = "rpc" }
+rpc_derive = { path = "rpc_derive" }

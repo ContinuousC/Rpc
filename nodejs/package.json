@@ -1,0 +1,21 @@
+{
+  "name": "rpc",
+  "version": "0.1.17",
+  "collaborators": [
+      "Maarten Deprez <mdp@si-int.eu>",
+      "André Bongima <abo@si-int.eu>"
+  ],
+  "description": "Rpc classes for NodeJS.",
+  "repository": {
+    "type": "git",
+    "url": "ssh://git@sigit01/~/Development/ContinuousC/Rpc"
+  },
+  "files": [
+    "rpc_client.js",
+    "varint.js"
+  ],
+  "main": "rpc_client.js",
+  "dependencies": {
+    "cbor": "^8.1.0"
+  }
+}

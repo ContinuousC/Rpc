@@ -1,0 +1,22 @@
+[package]
+name = "rpc_derive"
+version = "0.1.22"
+description = "Rpc derivation macro"
+authors = ["Maarten Deprez <mdp@continuousc.eu>"]
+repository = "https://github.com/ContinuousC/Rpc.git"
+license = "Elastic-2.0"
+edition = "2021"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+proc-macro2 = "1"
+quote = "1.0"
+darling = "0.20"
+
+[features]
+schemars = []
+tracing = []

@@ -1,0 +1,590 @@
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
+    sync::mpsc,
+    test,
+};
+
+use rpc::{
+    rpc, tls_client_config, tls_server_config, AsyncBroker, AsyncBrokerClient,
+    AsyncBrokerHandlerBuilder, AsyncClientConnection, AsyncRequest,
+    AsyncResponse, AsyncServerConnection, BrokerHandler, BrokerNode, Connector,
+    JsonReadStream, JsonStream, JsonWriteStream, MsgReadStream, MsgStream,
+    MsgWriteStream, TlsStreamExt,
+};
+
+#[rpc(service, stub(extra_args = "agent_id: AgentId"))]
+trait AgentService {
+    async fn ping(&self, arg: String) -> String;
+}
+
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+pub struct AgentId(String);
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+pub struct OrgId(String);
+
+#[derive(Default)]
+struct Node<V> {
+    agents: HashMap<AgentId, mpsc::Sender<BrokerToAgentMsg<V>>>,
+    backend: Option<mpsc::Sender<BrokerToBackendMsg<V>>>,
+}
+
+#[test]
+async fn broker() {
+    let backend_path = PathBuf::from("tests/backend.sock");
+    let agent_path = PathBuf::from("tests/agent.sock");
+
+    let agent1_id = AgentId(String::from("test agent1"));
+    let agent2_id = AgentId(String::from("test agent2"));
+
+    if backend_path.exists() {
+        fs::remove_file(&backend_path).await.unwrap();
+    }
+    if agent_path.exists() {
+        fs::remove_file(&agent_path).await.unwrap();
+    }
+
+    let broker = create_broker(&backend_path, &agent_path).await;
+
+    let agent1 = Agent::new(
+        agent_path.clone(),
+        Path::new("tests/certs/agent1.crt"),
+        Path::new("tests/certs/agent1.key"),
+    )
+    .await;
+    let agent2 = Agent::new(
+        agent_path,
+        Path::new("tests/certs/agent2.crt"),
+        Path::new("tests/certs/agent2.key"),
+    )
+    .await;
+
+    let backend = Backend::new(&backend_path).await;
+
+    backend
+        .connected(std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    agent1
+        .connected(std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    agent2
+        .connected(std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let res1 = backend
+        .agent_connector
+        .ping(agent1_id, "test".to_string())
+        .await;
+    let res2 = backend
+        .agent_connector
+        .ping(agent2_id, "test".to_string())
+        .await;
+
+    eprintln!("Result 1: {:?}", res1);
+    eprintln!("Result 2: {:?}", res2);
+
+    assert_eq!(res1.as_deref(), Ok("test"));
+    assert_eq!(res2.as_deref(), Ok("test"));
+
+    backend.shutdown().await.unwrap();
+    agent1.shutdown().await.unwrap();
+    agent2.shutdown().await.unwrap();
+    broker.shutdown().await.unwrap()
+}
+
+async fn create_broker(
+    backend_path: &Path,
+    agent_path: &Path,
+) -> AsyncBroker<Node<serde_json::Value>> {
+    let tls_config = tls_server_config(
+        Path::new("tests/certs/ca.crt"),
+        Path::new("tests/certs/broker.crt"),
+        Path::new("tests/certs/broker.key"),
+    )
+    .await
+    .expect("failed to make server tls config");
+
+    let agent_listener =
+        AsyncBrokerHandlerBuilder::<Node<serde_json::Value>, _>::new()
+            .unix(agent_path.to_path_buf())
+            .expect("failed to bind")
+            .tls(tls_config.clone())
+            .handler(AgentBrokerHandler::new());
+
+    let backend_listener =
+        AsyncBrokerHandlerBuilder::<Node<serde_json::Value>, _>::new()
+            .unix(backend_path.to_path_buf())
+            .expect("failed to bind")
+            .tls(tls_config)
+            .handler(BackendBrokerHandler::new());
+
+    AsyncBroker::builder()
+        .handler(backend_listener)
+        .handler(agent_listener)
+        .build()
+}
+
+impl<V> Node<V> {
+    fn is_empty(&self) -> bool {
+        self.agents.is_empty() && self.backend.is_none()
+    }
+}
+
+impl<V> BrokerNode for Node<V> {
+    type Key = OrgId;
+}
+
+struct AgentBrokerHandler;
+struct BackendBrokerHandler;
+
+impl AgentBrokerHandler {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl BackendBrokerHandler {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> BrokerHandler<tokio_rustls::server::TlsStream<S>> for AgentBrokerHandler
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    type Key = (OrgId, AgentId);
+    type Node = Node<serde_json::Value>;
+    type ReadStream = JsonReadStream<
+        ReadHalf<tokio_rustls::server::TlsStream<S>>,
+        Self::ReadMsg,
+    >;
+    type WriteStream = JsonWriteStream<
+        WriteHalf<tokio_rustls::server::TlsStream<S>>,
+        Self::WriteMsg,
+    >;
+    type ReadMsg = AgentToBrokerMsg<serde_json::Value>;
+    type WriteMsg = BrokerToAgentMsg<serde_json::Value>;
+
+    fn get_key(
+        &self,
+        stream: &tokio_rustls::server::TlsStream<S>,
+    ) -> rpc::Result<Self::Key> {
+        let (org, cn) =
+            stream.peer_org_and_cn().ok_or(rpc::Error::Authentication)?;
+        Ok((OrgId(org), AgentId(cn)))
+    }
+
+    fn add_node(
+        &self,
+        nodes: &mut HashMap<OrgId, Self::Node>,
+        (org, agent): &Self::Key,
+        sender: mpsc::Sender<Self::WriteMsg>,
+    ) -> rpc::Result<()> {
+        match nodes
+            .entry(org.clone())
+            .or_insert_with(Self::Node::default)
+            .agents
+            .entry(agent.clone())
+        {
+            Entry::Occupied(_) => Err(rpc::Error::Authentication),
+            Entry::Vacant(ent) => {
+                ent.insert(sender);
+                Ok(())
+            }
+        }
+    }
+
+    fn remove_node(
+        &self,
+        nodes: &mut HashMap<OrgId, Self::Node>,
+        (org, agent): &Self::Key,
+    ) {
+        if let Some(node) = nodes.get_mut(org) {
+            node.agents.remove(agent);
+            if node.is_empty() {
+                nodes.remove(org);
+            }
+        }
+    }
+
+    fn get_node<'a>(
+        &self,
+        nodes: &'a HashMap<OrgId, Self::Node>,
+        (org, _agent): &Self::Key,
+    ) -> Option<&'a Self::Node> {
+        nodes.get(org)
+    }
+
+    fn make_msg_stream(
+        &self,
+        stream: tokio_rustls::server::TlsStream<S>,
+    ) -> (Self::ReadStream, Self::WriteStream) {
+        JsonStream::new(stream).split()
+    }
+
+    fn handle_message(
+        &self,
+        node: &Self::Node,
+        (_, agent): &Self::Key,
+        msg: Self::ReadMsg,
+    ) -> std::result::Result<(), Self::WriteMsg> {
+        match msg {
+            AgentToBrokerMsg::Backend(msg) => match &node.backend {
+                Some(backend) => {
+                    match backend.try_send(BrokerToBackendMsg::Agent {
+                        agent_id: agent.clone(),
+                        message: msg,
+                    }) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Ok(()), // ignore msg when queue is full
+                    }
+                }
+                None => Ok(()), // ignore msg when backend is not connected
+            },
+        }
+    }
+}
+
+impl<S> BrokerHandler<tokio_rustls::server::TlsStream<S>>
+    for BackendBrokerHandler
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    type Key = OrgId;
+    type Node = Node<serde_json::Value>;
+    type ReadStream = JsonReadStream<
+        ReadHalf<tokio_rustls::server::TlsStream<S>>,
+        Self::ReadMsg,
+    >;
+    type WriteStream = JsonWriteStream<
+        WriteHalf<tokio_rustls::server::TlsStream<S>>,
+        Self::WriteMsg,
+    >;
+    type ReadMsg = BackendToBrokerMsg<serde_json::Value>;
+    type WriteMsg = BrokerToBackendMsg<serde_json::Value>;
+
+    fn get_key(
+        &self,
+        stream: &tokio_rustls::server::TlsStream<S>,
+    ) -> rpc::Result<Self::Key> {
+        let org = stream
+            .peer_organization()
+            .ok_or(rpc::Error::Authentication)?;
+        Ok(OrgId(org))
+    }
+
+    fn add_node(
+        &self,
+        nodes: &mut HashMap<OrgId, Self::Node>,
+        org: &Self::Key,
+        sender: mpsc::Sender<Self::WriteMsg>,
+    ) -> rpc::Result<()> {
+        let opt = &mut nodes
+            .entry(org.clone())
+            .or_insert_with(Self::Node::default)
+            .backend;
+        match opt.is_none() {
+            true => {
+                let _ = opt.insert(sender);
+                Ok(())
+            }
+            false => Err(rpc::Error::Authentication),
+        }
+    }
+
+    fn remove_node(
+        &self,
+        nodes: &mut HashMap<OrgId, Self::Node>,
+        org: &Self::Key,
+    ) {
+        if let Some(node) = nodes.get_mut(org) {
+            node.backend.take();
+            if node.is_empty() {
+                nodes.remove(org);
+            }
+        }
+    }
+
+    fn get_node<'a>(
+        &self,
+        nodes: &'a HashMap<OrgId, Self::Node>,
+        org: &Self::Key,
+    ) -> Option<&'a Self::Node> {
+        nodes.get(org)
+    }
+
+    fn make_msg_stream(
+        &self,
+        stream: tokio_rustls::server::TlsStream<S>,
+    ) -> (Self::ReadStream, Self::WriteStream) {
+        JsonStream::new(stream).split()
+    }
+
+    fn handle_message(
+        &self,
+        node: &Self::Node,
+        _org: &Self::Key,
+        msg: Self::ReadMsg,
+    ) -> std::result::Result<(), Self::WriteMsg> {
+        match msg {
+            BackendToBrokerMsg::Agent { agent_id, message } => {
+                let req_id = message.req_id;
+                match node.agents.get(&agent_id) {
+                    Some(agent) => {
+                        match agent.try_send(BrokerToAgentMsg::Backend(message))
+                        {
+                            Ok(()) => Ok(()),
+                            Err(_e) => Err(BrokerToBackendMsg::Agent {
+                                agent_id,
+                                message: AsyncResponse {
+                                    req_id,
+                                    response: serde_json::json!({
+                                        "Err": "agent queue congested"
+                                    }),
+                                },
+                            }),
+                        }
+                    }
+                    None => Err(BrokerToBackendMsg::Agent {
+                        agent_id,
+                        message: AsyncResponse {
+                            req_id,
+                            response: serde_json::json!({
+                                "Err": "agent not connected"
+                            }),
+                        },
+                    }),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum AgentToBrokerMsg<V> {
+    Backend(AsyncResponse<V>),
+}
+
+#[derive(Serialize, Deserialize)]
+enum BrokerToAgentMsg<V> {
+    Backend(AsyncRequest<V>),
+}
+
+#[derive(Serialize, Deserialize)]
+enum BackendToBrokerMsg<V> {
+    Agent {
+        agent_id: AgentId,
+        message: AsyncRequest<V>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BrokerToBackendMsg<V> {
+    Agent {
+        agent_id: AgentId,
+        message: AsyncResponse<V>,
+    },
+}
+
+struct Agent {
+    broker_client: AsyncBrokerClient<
+        BrokerToAgentMsg<serde_json::Value>,
+        AgentToBrokerMsg<serde_json::Value>,
+    >,
+    server: AsyncServerConnection<AgentProto>,
+}
+
+impl Agent {
+    async fn new(
+        agent_path: PathBuf,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Self {
+        let (agent_sender, agent_receiver) = mpsc::channel(1000);
+        let broker_client = AsyncBrokerClient::<
+            BrokerToAgentMsg<serde_json::Value>,
+            AgentToBrokerMsg<serde_json::Value>,
+        >::new(
+            Connector::unix(agent_path)
+                .tls(
+                    tls_client_config(
+                        Path::new("tests/certs/ca.crt"),
+                        cert_path,
+                        key_path,
+                    )
+                    .await
+                    .unwrap(),
+                    "localhost",
+                )
+                .unwrap()
+                .json(),
+            move |msg| match msg {
+                BrokerToAgentMsg::Backend(req) => {
+                    match agent_sender.try_send(req) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            Err(AgentToBrokerMsg::Backend(AsyncResponse::<
+                                serde_json::Value,
+                                u64,
+                            >::from_send_error::<
+                                String,
+                            >(
+                                e
+                            )))
+                        }
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let server = AsyncServerConnection::new_split(
+            agent_receiver.map(|msg| ((), msg)),
+            broker_client
+                .sender()
+                .map(|((), msg)| AgentToBrokerMsg::Backend(msg)),
+            Arc::new(AgentHandler(AgentServer)),
+        );
+        Self {
+            broker_client,
+            server,
+        }
+    }
+
+    async fn connected(&self, timeout: std::time::Duration) -> Result<()> {
+        self.broker_client.connected(timeout).await.unwrap();
+        Ok(())
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        self.server.shutdown().await.unwrap();
+        self.broker_client.shutdown().await.unwrap();
+        Ok(())
+    }
+}
+
+struct AgentServer;
+
+impl AgentService for AgentServer {
+    type Error = Error;
+    async fn ping(&self, arg: String) -> Result<String> {
+        Ok(arg)
+    }
+}
+
+struct Backend {
+    agent_connector: AgentServiceStub<
+        AsyncClientConnection<AgentProto, serde_json::Value, (AgentId,)>,
+        serde_json::Value,
+    >,
+    broker_client: AsyncBrokerClient<
+        BrokerToBackendMsg<serde_json::Value>,
+        BackendToBrokerMsg<serde_json::Value>,
+    >,
+}
+
+impl Backend {
+    async fn new(backend_path: &Path) -> Self {
+        let (backend_sender, backend_receiver) = mpsc::channel(1000);
+        let broker_client = AsyncBrokerClient::new_unconnected(
+            Connector::unix(backend_path.to_path_buf())
+                .tls(
+                    tls_client_config(
+                        Path::new("tests/certs/ca.crt"),
+                        Path::new("tests/certs/backend.crt"),
+                        Path::new("tests/certs/backend.key"),
+                    )
+                    .await
+                    .unwrap(),
+                    "localhost",
+                )
+                .unwrap()
+                .json(),
+            {
+				let backend_sender = backend_sender.clone();
+				move |msg| match msg {
+                BrokerToBackendMsg::Agent { agent_id, message } => {
+                    let _ = backend_sender.try_send(((agent_id,), message));
+                    Ok(())
+                }
+            }},
+            {
+                let backend_sender = backend_sender.clone();
+                move |msg| match msg {
+                    BackendToBrokerMsg::Agent {
+                        agent_id,
+                        message: AsyncRequest { req_id, .. },
+                    } => backend_sender
+                        .try_send((
+                            (agent_id,),
+                            AsyncResponse {
+                                req_id,
+                                response: serde_json::json!({"Err": "not connected"}),
+                            },
+                        ))
+                        .ok()
+                        .unwrap(),
+                }
+            },
+        )
+        .unwrap();
+
+        let agent_connector = AgentServiceStub(
+            AsyncClientConnection::new_split(
+                backend_receiver,
+                broker_client.sender().map(|((agent_id,), message)| {
+                    BackendToBrokerMsg::Agent { agent_id, message }
+                }),
+            ),
+            PhantomData,
+        );
+
+        Self {
+            broker_client,
+            agent_connector,
+        }
+    }
+
+    async fn connected(&self, timeout: std::time::Duration) -> Result<()> {
+        self.broker_client.connected(timeout).await.unwrap();
+        Ok(())
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        //self.agent_connector.shutdown().await.unwrap();
+        self.broker_client.shutdown().await.unwrap();
+        Ok(())
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Error, Debug)]
+enum Error {
+    // #[error("failed to accept: {0}")]
+    // Accept(std::io::Error),
+    // #[error("failed to bind: {0}")]
+    // Bind(std::io::Error),
+    // #[error("missing peer certificate")]
+    // MissingPeerCert,
+    // #[error("node is missing")]
+    // MissingNode,
+    // #[error("recv failed: {0}")]
+    // Recv(rpc::Error),
+    // #[error("send failed: {0}")]
+    // Send(rpc::Error),
+    // #[error("handler failure")]
+    // Handler,
+}
