@@ -1,5 +1,7 @@
 #!/bin/bash
 
+rm -f *.crt *.key
+
 openssl req -x509 -newkey rsa:4096 -nodes -keyout ca.key -out ca.crt -days 365 -subj '/CN=test CA/emailAddress=mnow@si-int.eu' -addext 'subjectAltName=DNS:mndev02,DNS:mndev02.sit.be,DNS:localhost,IP:127.0.0.1,IP:192.168.10.30'
 
 openssl req -newkey rsa:4096 -nodes -keyout server.key -out server.req -subj "/CN=test server/emailAddress=mnow@si-int.eu"
