@@ -1,6 +1,6 @@
 [package]
 name = "rpc_derive"
-version = "0.1.22"
+version = "0.1.23"
 description = "Rpc derivation macro"
 authors = ["Maarten Deprez <mdp@continuousc.eu>"]
 repository = "https://github.com/ContinuousC/Rpc.git"
